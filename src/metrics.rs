@@ -59,6 +59,15 @@ impl Metrics {
         }
     }
 
+    /// Record one raw line. Invalid UTF-8 is replaced with U+FFFD (such a
+    /// line then normally fails to parse and counts as malformed).
+    pub fn record_bytes(&mut self, line: &[u8]) {
+        match std::str::from_utf8(line) {
+            Ok(s) => self.record_line(s.trim_end_matches('\r')),
+            Err(_) => self.record_line(&String::from_utf8_lossy(line)),
+        }
+    }
+
     fn size_hint(&self) -> usize {
         self.ip_counts.len() + self.endpoint_counts.len()
     }

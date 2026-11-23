@@ -3,13 +3,13 @@
 //! Architecture (bounded memory, all cores busy during the CPU-heavy part):
 //!
 //! ```text
-//!  file --BufReader--> Vec<String> (<= chunk_size lines)
-//!                          |
-//!                  rayon par_iter: fold (per-task Metrics) -> reduce (merge)
+//!  reader thread: file --BufReader--> byte buffer (<= chunk_size lines)
+//!                          | bounded channel (1 chunk)
+//!  main thread: rayon par_split: fold (per-task Metrics) -> reduce (merge)
 //!                          |
 //!                   chunk Metrics --merge--> global Metrics
 //!                          |
-//!                  chunk.clear(); read next chunk
+//!                  drop buffer; receive next chunk
 //! ```
 //!
 //! Peak RAM ~ one chunk of lines + the maps of *distinct* IPs/endpoints.
@@ -19,9 +19,11 @@ mod metrics;
 mod parser;
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::fmt::Write as _;
+use std::io::{self, BufRead, BufReader, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Instant;
 
 use clap::Parser;
@@ -52,72 +54,93 @@ fn parse_chunk_size(s: &str) -> Result<usize, String> {
 
 /// Parse one chunk on all cores and return its combined `Metrics`.
 ///
-/// BORROWING: `lines: &[String]` is a *shared* borrow. Rayon requires the
-/// closure and items to be `Send + Sync`; `&String` is `Sync` because
-/// shared references to immutable data are safe to read from many threads.
-/// Rust proves there are no writers: the caller owns the `Vec` and cannot
-/// mutate or `clear()` it until this function returns and the borrow ends.
-/// Rayon's parallel iterators are fork-join: they block until every task
-/// has finished, so no thread can still be reading when the caller clears
-/// the `Vec`. No `Arc`, no `Mutex`.
-fn process_chunk(lines: &[String]) -> Metrics {
-    lines
-        .par_iter()
-        // `fold`: rayon splits the slice into pieces (work stealing) and
-        // each piece gets its OWN accumulator from `Metrics::default`.
-        // Accumulators are moved through the closure by value, so each is
-        // only ever touched by one thread at a time: no locks.
+/// `chunk` is one contiguous byte buffer holding up to `chunk_size` lines.
+/// One big allocation per chunk replaces one `String` per line, which is
+/// where most of the old time went.
+///
+/// BORROWING: `&[u8]` is a shared borrow. `par_split` hands rayon tasks
+/// sub-slices (`&[u8]`) of that one buffer; `&[u8]` is `Send + Sync` since
+/// many threads can safely read immutable data. Rust proves nobody mutates
+/// the buffer while it is borrowed. Rayon is fork-join: this call blocks
+/// until every task is done, so the buffer cannot be freed or reused while
+/// a worker still reads it. No `Arc`, no `Mutex`.
+fn process_chunk(chunk: &[u8]) -> Metrics {
+    // The buffer ends with the last line's '\n'; drop it so the split does
+    // not produce a phantom empty line at the end.
+    let body = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+    body.par_split(|&b| b == b'\n')
+        // `fold`: each piece of the work gets its OWN accumulator from
+        // `Metrics::default`. Accumulators move through the closure by
+        // value, so each is touched by one thread at a time: no locks.
         .fold(Metrics::default, |mut acc, line| {
-            acc.record_line(line);
+            acc.record_bytes(line);
             acc
         })
-        // `reduce`: combine the per-piece accumulators pairwise in a tree.
-        // Valid because `merge` is associative; `default` is the identity.
+        // `reduce`: combine accumulators pairwise in a tree. Valid because
+        // `merge` is associative and `default` is the identity.
         .reduce(Metrics::default, |mut a, b| {
             a.merge(b);
             a
         })
 }
 
-/// Turn raw bytes into a `String` without ever failing: invalid UTF-8 is
-/// replaced with U+FFFD (such lines then simply fail to parse), and the
-/// trailing `\n` / `\r\n` is removed.
-fn decode_line(buf: &[u8]) -> String {
-    let text = String::from_utf8_lossy(buf); // borrows if valid, else allocates
-    text.trim_end_matches(['\n', '\r']).to_owned()
+/// Reader side of the pipeline: fill byte buffers of `chunk_size` lines and
+/// send them to the processing side.
+///
+/// Raw bytes (`read_until`) instead of `BufRead::lines()` so one invalid
+/// UTF-8 line cannot abort the run. Real I/O errors are sent through the
+/// channel and stop the run; those are not bad data.
+fn read_chunks(file: File, chunk_size: usize, tx: SyncSender<io::Result<Vec<u8>>>) {
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    loop {
+        let mut chunk = Vec::with_capacity(chunk_size.min(1 << 20) * 128);
+        let mut lines = 0;
+        while lines < chunk_size {
+            match reader.read_until(b'\n', &mut chunk) {
+                Ok(0) => break, // EOF
+                Ok(_) => lines += 1,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        }
+        if lines == 0 {
+            return;
+        }
+        // `send` moves ownership of the buffer to the other thread, so the
+        // compiler guarantees this thread cannot touch it afterwards.
+        // The channel holds at most 1 chunk, so the reader runs ahead by a
+        // bounded amount: memory stays at ~3 chunks (reading, queued,
+        // processing) regardless of file size.
+        if tx.send(Ok(chunk)).is_err() {
+            return; // consumer stopped
+        }
+        if lines < chunk_size {
+            return; // EOF reached mid-chunk
+        }
+    }
 }
 
 fn run(args: &Args) -> io::Result<(Metrics, u64)> {
     let file = File::open(&args.file)?;
     let file_len = file.metadata()?.len();
-    let mut reader = BufReader::with_capacity(1 << 20, file);
-
-    // Reserve once, capped so a huge `--chunk-size` doesn't pre-allocate GBs.
-    let mut chunk: Vec<String> = Vec::with_capacity(args.chunk_size.min(1 << 20));
-    let mut raw = Vec::with_capacity(4096); // reused byte buffer
+    let chunk_size = args.chunk_size;
     let mut global = Metrics::default();
 
-    loop {
-        raw.clear();
-        // Read bytes, not `String`s: `BufRead::lines()` would abort the
-        // whole run with an error on the first invalid-UTF-8 line.
-        // Real I/O errors still propagate via `?`; those are not bad data.
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            break; // EOF
-        }
-        chunk.push(decode_line(&raw));
-
-        if chunk.len() >= args.chunk_size {
-            // `&chunk` borrows the Vec immutably for the call only.
+    // Bounded channel: reader thread fills chunk N+1 while rayon parses
+    // chunk N. `scope` lets the thread borrow locals and guarantees it is
+    // joined before `run` returns.
+    let (tx, rx) = sync_channel::<io::Result<Vec<u8>>>(1);
+    std::thread::scope(|scope| {
+        scope.spawn(move || read_chunks(file, chunk_size, tx));
+        for msg in rx {
+            let chunk = msg?;
             global.merge(process_chunk(&chunk));
-            // The borrow has ended, so mutation is allowed again. `clear`
-            // drops the Strings but keeps the Vec's capacity.
-            chunk.clear();
+            // `chunk` is dropped here, freeing the buffer.
         }
-    }
-    if !chunk.is_empty() {
-        global.merge(process_chunk(&chunk)); // final partial chunk
-    }
+        Ok::<(), io::Error>(())
+    })?;
     Ok((global, file_len))
 }
 
@@ -135,38 +158,45 @@ fn peak_rss_mib() -> Option<f64> {
 }
 
 fn print_report(m: &Metrics, file_len: u64, secs: f64) {
+    // Build the report in memory, then write once and ignore a closed pipe
+    // (e.g. `| head`) instead of letting `println!` panic.
+    let mut out = String::new();
+    macro_rules! p {
+        ($($arg:tt)*) => {{ let _ = writeln!(out, $($arg)*); }};
+    }
     let line = "=".repeat(52);
-    println!("{line}\n LOG ANALYSIS REPORT\n{line}");
-    println!(" Total lines processed : {}", m.total_lines);
-    println!(" Malformed lines       : {}", m.malformed_lines);
-    println!(" Rescued by regex      : {}", m.regex_rescued);
+    p!("{line}\n LOG ANALYSIS REPORT\n{line}");
+    p!(" Total lines processed : {}", m.total_lines);
+    p!(" Malformed lines       : {}", m.malformed_lines);
+    p!(" Rescued by regex      : {}", m.regex_rescued);
 
-    println!("\n Requests by status code");
+    p!("\n Requests by status code");
     let mut statuses: Vec<_> = m.status_counts.iter().collect();
     statuses.sort_unstable();
     for (code, count) in statuses {
-        println!("   {code}: {count}");
+        p!("   {code}: {count}");
     }
 
-    println!("\n Top 5 IP addresses");
+    p!("\n Top 5 IP addresses");
     for (i, (ip, c)) in top_n(&m.ip_counts, 5).iter().enumerate() {
-        println!("   {}. {ip:<40} {c}", i + 1);
+        p!("   {}. {ip:<40} {c}", i + 1);
     }
-    println!("\n Top 5 endpoints");
+    p!("\n Top 5 endpoints");
     for (i, (ep, c)) in top_n(&m.endpoint_counts, 5).iter().enumerate() {
-        println!("   {}. {ep:<40} {c}", i + 1);
+        p!("   {}. {ep:<40} {c}", i + 1);
     }
 
-    println!("\n{line}");
-    println!(" Execution time        : {secs:.3} s");
+    p!("\n{line}");
+    p!(" Execution time        : {secs:.3} s");
     if secs > 0.0 {
-        println!(" Throughput            : {:.0} lines/s, {:.1} MiB/s",
+        p!(" Throughput            : {:.0} lines/s, {:.1} MiB/s",
             m.total_lines as f64 / secs, file_len as f64 / secs / (1024.0 * 1024.0));
     }
     if let Some(rss) = peak_rss_mib() {
-        println!(" Peak memory (RSS)     : {rss:.1} MiB");
+        p!(" Peak memory (RSS)     : {rss:.1} MiB");
     }
-    println!("{line}");
+    p!("{line}");
+    let _ = io::stdout().write_all(out.as_bytes());
 }
 
 fn main() -> ExitCode {

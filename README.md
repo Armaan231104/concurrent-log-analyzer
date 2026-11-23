@@ -25,12 +25,12 @@ cargo build --release
 
 ## How it works
 
-1. The file is read line by line with a buffered reader, never loaded whole.
-2. Lines are collected into batches of `--chunk-size`.
-3. Each batch is parsed in parallel with Rayon. Every worker keeps its own counters, so no locks are needed.
-4. The batch results are merged into one running total, the batch is cleared, and the next one is read.
+1. A reader thread reads the file with a buffered reader, never loading it whole, and collects lines into batches of `--chunk-size`.
+2. Each batch is parsed in parallel with Rayon. Every worker keeps its own counters, so no locks are needed.
+3. While one batch is being parsed, the reader is already filling the next one. A small bounded queue keeps memory capped.
+4. The batch results are merged into one running total and the batch is freed.
 
-Memory use depends on the batch size and the number of distinct IPs and endpoints, not on the file size.
+Memory use depends on the batch size (about 8 MB with `-c 1000`, about 31 MB at the default) and the number of distinct IPs and endpoints, not on the file size.
 
 Each line is parsed with plain string splitting first. If that fails, a regex is tried. If that fails too, the line is counted as malformed and skipped. Invalid UTF-8 is handled the same way, so bad data cannot crash the run.
 
@@ -40,7 +40,7 @@ Test file: 5.2 million lines (0.5 GB), generated with `scripts/gen_log.py`, abou
 
 | | Time | Peak memory |
 |---|---|---|
-| Rust (this tool) | 2.6 s | 22 MB |
+| Rust (this tool) | 1.9 s | 31 MB |
 | Plain Python script with the same regex | 6.1 s | 14 MB |
 
 Both report the same line and malformed counts. To try it yourself:

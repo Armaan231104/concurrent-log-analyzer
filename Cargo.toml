@@ -1,0 +1,16 @@
+[package]
+name = "log_analyzer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.9", features = ["derive"] }
+rayon = "1.12.0"
+regex = "1.13.2"
+
+# Release profile tuned for a CPU-bound batch tool.
+[profile.release]
+opt-level = 3
+lto = "fat"        # cross-crate inlining (regex, rayon, std)
+codegen-units = 1  # slower compile, faster code
+panic = "abort"    # no unwinding tables; we never panic on bad data anyway
